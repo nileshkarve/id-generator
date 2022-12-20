@@ -16,48 +16,84 @@ import org.springframework.transaction.annotation.Transactional;
  */
 public class EntityIdGenerator {
 	
+	private static final SimpleDateFormat dateFormatter = new SimpleDateFormat("yyyyMMdd'T'hhmmss.SSS");
+	
+	private static final Set<String> entitiesWithGeneratedId = new HashSet<>();
+	
+	@Autowired
 	private JdbcTemplate jdbcTemplate;
 	
-	@Transactional
-	public Long generateAndSetId(PersistentEntity entity) {
+	@Transactional(transactionManager = "transactionManager")
+	public <T extends PersistentEntity> Long generateAndSetId(T entity) {
 		Long id = generateIdFor(entity.getEntityTableName());
 		entity.setId(id);
 		return id;
 	}
 	
-	@Transactional
-	public List<Long> generateAndSetIds(List<? extends PersistentEntity> entities) {
-		List<Long> ids = generateRangeOfIdsFor(entities.get(0).getEntityTableName(), entities.size());
-		entities.stream().forEachOrdered(entity -> entity.setId(ids.remove(0)));
-		return ids;
+	@Transactional(transactionManager = "transactionManager")
+	public <T extends PersistentEntity> List<Long> generateAndSetIds(List<T> entities) {
+		if(null == entities || entities.isEmpty()) {
+			return new ArrayList<>();
+		}
+		else {
+			List<Long> ids = generateRangeOfIdsFor(entities.get(0).getEntityTableName(), entities.size());
+			entities.stream().forEachOrdered(entity -> entity.setId(ids.remove(0)));
+			return ids;
+		}
 	}
 	
-	@Transactional
+	@Transactional(transactionManager = "transactionManager")
 	public Long generateIdFor(String tableName) {
 		return generateRangeOfIdsFor(tableName, 1).get(0);
 	}
 
-	@Transactional
+	@Transactional(transactionManager = "transactionManager")
 	public List<Long> generateRangeOfIdsFor(String tableName, int numberOfIds) {
-		String updateLockQuery = "UPDATE entity_id_rgstry SET crnt_id = (SELECT rgstry.crnt_id FROM entity_id_rgstry rgstry WHERE rgstry.entity = ?) WHERE entity = ?";
-		jdbcTemplate.update(updateLockQuery, tableName, tableName);
+		if(!isIdPresentForEntity(tableName)) {
+			String insertEntity = "INSERT INTO ENTITY_ID_REGISTRY(ENTITY, CURRENT_ID)VALUES(?,?)";
+			jdbcTemplate.update(insertEntity, tableName, 999L);
+			entitiesWithGeneratedId.add(tableName);
+		}
+		String lockString = generateUniqueStr();
+		
+		String updateLockQuery = "UPDATE ENTITY_ID_REGISTRY SET LOCK_STR = ? WHERE ENTITY = ?";
+		jdbcTemplate.update(updateLockQuery, lockString, tableName);
 		
 		
 		List<Long> ids = new ArrayList<>();
-		String entitySelector = "SELECT crnt_id FROM entity_id_rgstry WHERE entity = ?";
+		String entitySelector = "SELECT CURRENT_ID FROM ENTITY_ID_REGISTRY WHERE ENTITY = ? AND LOCK_STR = ?";
+		Long currentEntityId = jdbcTemplate.queryForObject(entitySelector, Long.class, tableName, lockString);
+
+		populateIds(currentEntityId, numberOfIds, ids);
+		String updateQuery = "UPDATE ENTITY_ID_REGISTRY SET CURRENT_ID = ?, LOCK_STR = ? WHERE ENTITY = ? AND LOCK_STR = ?";
+		jdbcTemplate.update(updateQuery, Long.sum(currentEntityId, numberOfIds), null, tableName, lockString);
+		
+		return ids;
+	}
+	
+	private boolean isIdPresentForEntity(String tableName) {
+		if(entitiesWithGeneratedId.contains(tableName)) {
+			return true;
+		}
+		String entitySelector = "SELECT CURRENT_ID FROM ENTITY_ID_REGISTRY WHERE ENTITY = ?";
 		Long currentEntityId = null;
 		try {
 			currentEntityId = jdbcTemplate.queryForObject(entitySelector, Long.class, tableName);
+			if(null != currentEntityId) {
+				entitiesWithGeneratedId.add(tableName);
+			}
+			return null != currentEntityId;
 		}
 		catch(DataAccessException e) {
-			currentEntityId = 0L;
+			return false;
 		}
-		String insertEntity = "INSERT INTO entity_id_rgstry(entity,crnt_id)VALUES(?,?)";
-		jdbcTemplate.update(insertEntity, tableName, currentEntityId);
-		populateIds(currentEntityId, numberOfIds, ids);
-		String updateQuery = "UPDATE entity_id_rgstry SET crnt_id = ? WHERE entity = ?";
-		jdbcTemplate.update(updateQuery, Long.sum(currentEntityId, numberOfIds), tableName);
-		return ids;
+	}
+
+	private String generateUniqueStr() {
+		SecureRandom random = new SecureRandom();
+		Integer randomInt = 100000 + random.nextInt(900000);
+		String lockString = dateFormatter.format(new Date()).concat(randomInt.toString());
+		return lockString;
 	}
 	
 	public void setJdbcTemplate(JdbcTemplate jdbcTemplate) {
@@ -69,5 +105,4 @@ public class EntityIdGenerator {
 			ids.add(Long.sum(currentEntityId, Long.valueOf(i)));
 		}
 	}
-
 }
